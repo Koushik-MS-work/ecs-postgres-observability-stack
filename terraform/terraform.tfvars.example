@@ -1,0 +1,38 @@
+# Copy to terraform.tfvars (staging) or use -var-file for other environments.
+# terraform.tfvars is git-ignored — never commit real values.
+
+project_name = "devops-project"
+environment  = "staging"
+aws_region   = "us-east-1"
+
+vpc_cidr                  = "10.0.0.0/16"
+availability_zones        = ["us-east-1a", "us-east-1b"]
+public_subnet_cidrs       = ["10.0.0.0/24", "10.0.1.0/24"]
+private_app_subnet_cidrs  = ["10.0.10.0/24", "10.0.11.0/24"]
+private_db_subnet_cidrs   = ["10.0.20.0/24", "10.0.21.0/24"]
+
+enable_nat_gateway = true
+single_nat_gateway = true # set false in production for AZ-level NAT resilience
+
+container_image   = "123456789012.dkr.ecr.us-east-1.amazonaws.com/devops-project-staging:latest"
+container_port    = 3000
+app_task_cpu      = 256
+app_task_memory   = 512
+app_desired_count = 2
+app_min_count     = 2
+app_max_count     = 6
+health_check_path = "/health"
+
+db_engine_version        = "16.4"
+db_instance_class        = "db.t4g.micro"
+db_allocated_storage      = 20
+db_max_allocated_storage    = 100
+db_name                      = "appdb"
+db_username                   = "app_admin"
+db_multi_az                    = false # set true in production
+db_backup_retention_days        = 7
+db_deletion_protection           = false # set true in production
+db_skip_final_snapshot             = true # set false in production
+
+alarm_sns_topic_email = "devops-alerts@example.com"
+log_retention_days    = 30
