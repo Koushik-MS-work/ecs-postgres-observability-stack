@@ -1,0 +1,190 @@
+name: CD
+
+# Runs on merge to main: builds & pushes the image, scans it, deploys to
+# staging automatically, then waits for a manual approval gate (the
+# `production` GitHub Environment, configured with required reviewers)
+# before deploying to production.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write   # for OIDC -> AWS role assumption (no long-lived keys)
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: devops-project-staging
+  PROJECT_NAME: devops-project
+
+jobs:
+  build-and-push:
+    name: Build, Scan & Push Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_SHA::12}"
+          URI="${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${TAG}"
+          echo "image_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: docker build -t "${{ steps.meta.outputs.image_uri }}" ./app
+
+      - name: Scan image for vulnerabilities (block push on critical CVEs)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          severity: CRITICAL
+          exit-code: '1'
+          format: table
+          ignore-unfixed: true
+
+      - name: Push image to ECR
+        run: docker push "${{ steps.meta.outputs.image_uri }}"
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Render new ECS task definition with updated image
+        id: render
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.PROJECT_NAME }}-staging" \
+            --query taskDefinition > task-def.json
+          NEW_IMAGE="${{ needs.build-and-push.outputs.image_uri }}"
+          jq --arg IMAGE "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-def.json > new-task-def.json
+
+      - name: Register new task definition revision
+        id: register
+        run: |
+          TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=${TD_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy new revision to ECS (rolling update)
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.PROJECT_NAME }}-staging-cluster" \
+            --service "${{ env.PROJECT_NAME }}-staging-service" \
+            --task-definition "${{ steps.register.outputs.task_def_arn }}" \
+            --force-new-deployment
+
+      - name: Wait for service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.PROJECT_NAME }}-staging-cluster" \
+            --services "${{ env.PROJECT_NAME }}-staging-service"
+
+      - name: Smoke test staging health endpoint
+        run: |
+          curl -fsS --retry 5 --retry-delay 10 https://staging.example.com/health
+
+  deploy-production:
+    name: Deploy to Production (manual approval required)
+    needs: [build-and-push, deploy-staging]
+    runs-on: ubuntu-latest
+    # The `production` environment is configured in the repo's Settings ->
+    # Environments with "Required reviewers" enabled — GitHub blocks this
+    # job until an authorized reviewer approves it in the Actions UI.
+    environment:
+      name: production
+      url: https://app.example.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Render new ECS task definition with updated image
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.PROJECT_NAME }}-production" \
+            --query taskDefinition > task-def.json
+          NEW_IMAGE="${{ needs.build-and-push.outputs.image_uri }}"
+          jq --arg IMAGE "$NEW_IMAGE" \
+            '.containerDefinitions[0].image = $IMAGE
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-def.json > new-task-def.json
+
+      - name: Register new task definition revision
+        id: register
+        run: |
+          TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task_def_arn=${TD_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy new revision to ECS (rolling update, circuit breaker rollback enabled)
+        run: |
+          aws ecs update-service \
+            --cluster "${{ env.PROJECT_NAME }}-production-cluster" \
+            --service "${{ env.PROJECT_NAME }}-production-service" \
+            --task-definition "${{ steps.register.outputs.task_def_arn }}" \
+            --force-new-deployment
+
+      - name: Wait for service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ env.PROJECT_NAME }}-production-cluster" \
+            --services "${{ env.PROJECT_NAME }}-production-service"
+
+      - name: Smoke test production health endpoint
+        run: |
+          curl -fsS --retry 5 --retry-delay 10 https://app.example.com/health
+
+  notify:
+    name: Notify pipeline result
+    if: always()
+    needs: [build-and-push, deploy-staging, deploy-production]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack notification
+        if: ${{ always() && secrets.SLACK_WEBHOOK_URL != '' }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STATUS: ${{ contains(needs.*.result, 'failure') && 'FAILED' || 'SUCCEEDED' }}
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "Deployment pipeline ${{ env.STATUS }} for `${{ github.repository }}` — commit ${{ github.sha }} — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|view run>"
+            }
