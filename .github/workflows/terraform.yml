@@ -1,0 +1,121 @@
+name: Terraform Infra
+
+# Plans infrastructure changes on PRs that touch terraform/, and applies them
+# on merge to main — staging applies automatically, production requires
+# manual approval via the `production` GitHub Environment.
+on:
+  pull_request:
+    branches: [main]
+    paths: ['terraform/**']
+  push:
+    branches: [main]
+    paths: ['terraform/**']
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  plan:
+    name: Terraform Plan (staging)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.8.5'
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: terraform init
+        run: terraform init -backend-config=backend-staging.hcl.example
+
+      - name: terraform plan
+        id: plan
+        run: terraform plan -var-file=terraform.tfvars.example -no-color -out=tfplan
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: 'Terraform plan completed — see the Actions run for the full output.'
+            })
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply-staging:
+    name: Terraform Apply (staging)
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.8.5'
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: terraform init
+        run: terraform init -backend-config=backend-staging.hcl.example
+
+      - name: terraform apply
+        run: terraform apply -var-file=terraform.tfvars.example -auto-approve
+
+  apply-production:
+    name: Terraform Apply (production — manual approval required)
+    needs: apply-staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # `production` environment has required reviewers configured in repo
+    # Settings -> Environments, gating this job on manual approval.
+    environment:
+      name: production
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.8.5'
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_TERRAFORM_ROLE_ARN_PROD }}
+          aws-region: us-east-1
+
+      - name: terraform init
+        run: terraform init -backend-config=backend-production.hcl.example
+
+      - name: terraform apply
+        run: terraform apply -var-file=terraform.tfvars.example -var="environment=production" -auto-approve
