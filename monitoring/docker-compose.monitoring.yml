@@ -1,0 +1,102 @@
+# Local reference stack for monitoring + centralized logging. Useful for
+# development and for demonstrating dashboards/log pipelines without a full
+# AWS deployment. In AWS, the equivalent is CloudWatch (metrics, alarms,
+# dashboards — see terraform/monitoring.tf) fed by the "awslogs" driver on
+# ECS tasks and Fluent Bit as a log router (this same fluent-bit config is
+# reusable as an ECS FireLens sidecar).
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: ../app
+    ports:
+      - '3000:3000'
+    environment:
+      - PORT=3000
+      - NODE_ENV=development
+    labels:
+      - "logging=promtail"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - '9090:9090'
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports:
+      - '9093:9093'
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - '3001:3000'
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-changeme}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    ports:
+      - '9100:9100'
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    ports:
+      - '8080:8080'
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      - DATA_SOURCE_NAME=postgresql://app_admin:${DB_PASSWORD:-changeme}@postgres:5432/appdb?sslmode=disable
+    ports:
+      - '9187:9187'
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=appdb
+      - POSTGRES_USER=app_admin
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-changeme}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  # Centralized log collection: tails container/application logs and ships
+  # them to a sink (stdout here; swap outputs to CloudWatch Logs, OpenSearch,
+  # or Loki in real deployments).
+  fluent-bit:
+    image: fluent/fluent-bit:3.1
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - app
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  postgres-data:

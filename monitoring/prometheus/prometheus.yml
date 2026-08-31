@@ -1,0 +1,44 @@
+# Local/reference Prometheus config. In AWS this complements (not replaces)
+# CloudWatch metrics/alarms defined in terraform/monitoring.tf — useful for
+# local development, on-prem/self-managed deployments, or a Kubernetes-based
+# variant of this stack.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+scrape_configs:
+  # Application metrics: request rate, error rate, latency (see app/src/index.js /metrics)
+  - job_name: 'app'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['app:3000']
+        labels:
+          service: 'devops-project-app'
+
+  # Prometheus's own metrics
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Host-level infrastructure metrics (CPU, memory, disk, network)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # Postgres exporter for database metrics
+  - job_name: 'postgres-exporter'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # cAdvisor for per-container resource usage
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
